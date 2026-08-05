@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Weather + Air Quality (PM2.5) Predictor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">AeroSense</div>
+      <div class="theme-glow"></div>
+    </header>
+
+    <main class="grid">
+      <section class="panel search-panel">
+        <div class="panel-header">
+          <h2>Find Weather</h2>
+          <p>Type a city, region, or place.</p>
+        </div>
+        <form id="searchForm" class="search">
+          <input id="query" class="input" type="text" placeholder="Search location..." required />
+          <button class="btn" type="submit">Search</button>
+        </form>
+
+  <div id="geoResults" class="geocode-results" aria-live="polite"></div>
+
+        <div id="location" class="location"></div>
+
+        <div id="weather" class="cards weather"></div>
+      </section>
+
+      <section class="panel predict-panel">
+        <div class="panel-header">
+          <h2>Air Quality Prediction</h2>
+          <p>Powered by a hybrid RandomForest + ExtraTrees model.</p>
+        </div>
+
+        <div id="prediction" class="cards prediction">
+          <div class="card placeholder">
+            <div class="skeleton title"></div>
+            <div class="skeleton line"></div>
+            <div class="skeleton line"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</body>
+</html>

@@ -1,0 +1,318 @@
+PROJECT: Dark Weather + PM2.5 Prediction Web App (Flask + Vanilla JS + scikit-learn)
+
+This document explains, in absolute detail, the purpose and workings of every file in the repository, the machine learning models and feature engineering used, the APIs and libraries involved, and how data flows end-to-end.
+
+============================================================
+1) TOP-LEVEL FILES AND DIRECTORIES
+============================================================
+
+- app.py
+  Role: Flask web application entrypoint (server). Serves the frontend and exposes JSON APIs for geocoding, weather retrieval (with air-quality merge), and PM2.5 prediction.
+  Key responsibilities:
+  • Defines Flask routes:
+    - GET /                → Serves index.html (frontend shell)
+    - GET /api/geocode     → Calls Open-Meteo Geocoding API, returns up to 5 candidates so users can disambiguate same/similar city names.
+    - GET /api/weather     → Fetches weather for a text query or explicit coordinates, then merges pollutant series from the Air Quality API into the hourly block.
+    - POST /api/predict    → Accepts current feature vector and returns a PM2.5 prediction.
+  • Loads a pickled scikit-learn pipeline on-demand from ml/pm25_pipeline.pkl and caches it in memory. The pipeline is built to be unpickle-safe by referencing ml.features.FeatureAdder (a proper sklearn Transformer), avoiding “__main__” pickling issues.
+  • Input validation: Converts JSON fields to floats with a safe_float helper. If the pipeline can’t be loaded, falls back to a deterministic heuristic formula so the app remains functional.
+  • Logging: Prints basic info when artifacts load and on prediction calls to help with debugging.
+  External dependencies used here: Flask, requests, joblib, numpy, pathlib.
+
+- README.md
+  Role: Project overview and quickstart (if present). It typically outlines setup, running the Flask app, and how to train/evaluate the model.
+
+- requirements.txt
+  Role: Python dependencies used by the server-side and ML code.
+  Expected libraries in context:
+  • Flask               → web framework
+  • requests            → HTTP client for third-party APIs
+  • numpy               → numeric computing
+  • pandas              → CSV loading, tabular manipulation (for training)
+  • scikit-learn        → machine learning (pipeline, gradient boosting, KFold CV, etc.)
+  • joblib              → model serialization (save/load pickle files)
+
+- data/
+  • pm25_weather_kaggleish.csv
+    Role: A “Kaggle-like” synthetic or prepared dataset for training and evaluation. Contains the 9 base feature columns (see FEATURES below), a target column pm25, and may include extra explanatory/context columns.
+    Typical columns used directly by the model:
+    - temperature_2m (°C)
+    - relative_humidity_2m (%)
+    - apparent_temperature (°C)
+    - precipitation (mm)
+    - wind_speed_10m (m/s)
+    - surface_pressure (hPa)
+    - uv_index (index)
+    - dew_point_2m (°C)
+    - pm10 (µg/m³)
+    - pm25 (µg/m³) → target
+
+- ml/
+  • __init__.py
+    Role: Marks ml as a Python package so pickled artifacts can import ml.features during Flask runtime. This is critical to avoid unpickling errors in production.
+
+  • features.py
+    Role: Centralized feature definitions and a robust sklearn transformer.
+    Contents:
+    - FEATURES: A list specifying the expected input feature order (the 9 columns listed above). The app, training, and evaluation all depend on this order.
+    - add_features(X): A pure function that takes a numeric array of shape (n_samples, 9) and returns an augmented array with engineered features appended.
+      Engineered features (per row):
+        1) temp_dew_spread = temperature_2m − dew_point_2m
+           Rationale: A proxy for moisture saturation; low spread often relates to fog/smog potential.
+        2) rh_pm10 = relative_humidity_2m × pm10
+           Rationale: Interaction—when humidity is high, particulate matter can stay suspended longer; PM10 can correlate with PM2.5.
+        3) wind_inv = 1 / (1 + max(0, wind_speed_10m))
+           Rationale: Calm winds (low wind) tend to increase stagnation and pollution buildup; inversion magnifies this effect.
+        4) precip_bin = 1.0 if precipitation > 0 else 0.0
+           Rationale: Rain often scavenges particulates (wet deposition); binary flag helps trees.
+        5) app_minus_temp = apparent_temperature − temperature_2m
+           Rationale: Captures perceived heat load vs actual, which can reflect humidity/wind interplay.
+        6) uv2 = (uv_index)^2
+           Rationale: Nonlinear effect of UV on atmospheric chemistry (photochemical reactions can reduce/increase pollutants depending on context).
+        7) log_pm10 = log1p(max(0, pm10))
+           Rationale: Stabilizes the heavy-tailed distribution of PM10 for interaction effects.
+        8) press_center = surface_pressure − 1013.0
+           Rationale: Centers pressure around standard; can reflect synoptic conditions.
+    - FeatureAdder(BaseEstimator, TransformerMixin): An sklearn-compatible transformer that calls add_features in transform(). Referencing this class in the Pipeline ensures the pickle stores an importable symbol (ml.features.FeatureAdder), avoiding __main__ references.
+
+  • train_hybrid.py
+    Role: Trains the PM2.5 prediction pipeline from a CSV (or generates synthetic data if no CSV provided), and saves the trained pipeline as ml/pm25_pipeline.pkl plus a small metrics JSON.
+    Major components:
+    - CLI arguments:
+        --csv <path>     → external dataset path
+        --target <name>  → target column (default suggests pm25; autodetection supported in code for common aliases)
+        --limit <int>    → optional row subsampling for faster runs
+    - CSV loading with alias mapping (maps common names to canonical FEATURES). Produces X (n×9) and y arrays.
+    - Synthetic generator (fallback) to keep the project self-contained.
+    - Model builder (build_model):
+        Pipeline(
+          FeatureAdder(),
+          TransformedTargetRegressor(
+            regressor=HistGradientBoostingRegressor(
+              max_depth=6, learning_rate=0.08, max_iter=600, early_stopping=True,
+              validation_fraction=0.1, l2_regularization=1e-6, random_state=42
+            ),
+            func=log1p, inverse_func=expm1
+          )
+        )
+        Why this design:
+          • Trees don’t need numeric scaling; FeatureAdder gives nonlinear/interaction terms directly.
+          • HistGradientBoostingRegressor (HGB) is a fast, strong baseline for tabular data; supports early stopping and handles missing values internally (though we provide clean numerics here).
+          • TransformedTargetRegressor applies a log transform to the target to stabilize variance and heavy tails, with expm1 to return to the original scale.
+    - Train/validation split (e.g., 80/20), prints holdout R², and saves:
+        * ml/pm25_pipeline.pkl      → the artifact the Flask app loads
+        * ml/last_metrics.json      → tiny JSON with r2 and sizes for traceability
+    - Path import fix: ensures the project root is on sys.path so “from ml.features import FeatureAdder, FEATURES” works when invoking this script directly.
+
+  • eval_cv.py
+    Role: Cross-validated evaluation of the training pipeline on a dataset (serial, Windows-safe). Avoids joblib parallelism to prevent Windows _posixsubprocess issues.
+    Major components:
+    - CLI arguments: --csv, --target, --folds, --n_jobs_cv (ignored, kept for compatibility).
+    - Loads the dataset, extracts X and y using the canonical FEATURES list.
+    - Defines the same pipeline as in training (FeatureAdder + HGB wrapped with TransformedTargetRegressor).
+    - Uses KFold(shuffle=True, random_state=42). For each fold:
+        * Fit on train split; predict on test split.
+        * Compute R² (coefficient of determination) and collect results.
+    - Prints mean/std of R² across folds and an “Accuracy (R²) = XX.XX%” line for convenience.
+    - Path import fix mirrors training to ensure ml imports work from script.
+
+  • make_dataset.py
+    Role: Generates a Kaggle-like CSV with weather/pollution context and a plausible PM2.5 target based on synthetic heuristics. Useful when no external dataset is available.
+
+  • pm25_pipeline.pkl
+    Role: Serialized scikit-learn Pipeline artifact loaded by Flask for runtime predictions. It references ml.features.FeatureAdder, so unpickling is stable provided ml is a package and ml.features is importable.
+
+  • last_metrics.json
+    Role: Simple JSON produced at train time containing R² and train/valid set sizes for quick inspection or UI surfacing.
+
+  • pm25_hybrid.pkl, scaler.pkl (legacy)
+    Role: Older artifact pair from an earlier iteration (e.g., RandomForest/ExtraTrees + optional scaler). These can cause unpickling issues if the custom class name (Hybrid) isn’t importable in the same module path at load time. The current app intentionally avoids loading these legacy files and prefers pm25_pipeline.pkl instead.
+
+- static/
+  • app.js
+    Role: Frontend controller (vanilla JS) orchestrating UI interactions and API calls.
+    Responsibilities:
+    - Search flow: Calls /api/geocode to get candidates; displays a selectable list when multiple matches exist.
+    - Weather retrieval: After user chooses a candidate (or enters a unique name), calls /api/weather with lat/lon or q to retrieve weather + merged air-quality time series.
+    - Feature assembly: From the latest hourly values (or current block), builds the 9-feature vector expected by the server.
+    - Prediction: POSTs the feature vector to /api/predict and renders the returned PM2.5.
+    - Chart rendering: Creates a Chart.js doughnut (ring) chart for pollutant composition, with lifecycle management to destroy/recreate charts to avoid memory leaks.
+    - UX niceties: skeleton loaders, dark theme integration, chips/badges, and geocode candidate list.
+
+  • style.css
+    Role: Dark, sleek UI with glass-like cards. Controls layout, colors, spacing, and chart container styling. Includes styles for:
+    - Search bar and cards
+    - Geocode candidate list (hover/select states)
+    - Loading skeletons
+    - Chart and badges
+
+- templates/
+  • index.html
+    Role: Frontend HTML shell served by Flask (Jinja used only to serve static HTML here). Includes references to Chart.js CDN (or a local script), static CSS/JS, and contains placeholders/containers for weather and prediction panels.
+
+
+============================================================
+2) MACHINE LEARNING MODEL: ARCHITECTURE AND PIPELINE
+============================================================
+
+Inputs (FEATURES; order matters across app/train/eval):
+  1. temperature_2m (°C)
+  2. relative_humidity_2m (%)
+  3. apparent_temperature (°C)
+  4. precipitation (mm)
+  5. wind_speed_10m (m/s)
+  6. surface_pressure (hPa)
+  7. uv_index (index)
+  8. dew_point_2m (°C)
+  9. pm10 (µg/m³)
+
+Feature engineering (FeatureAdder):
+  Appends 8 engineered features to the 9 base features, forming a richer, nonlinear representation. See ml/features.py for formulas and rationale (moisture spread, wind inversion, precipitation flag, UV squared, log PM10, pressure centering, etc.).
+
+Estimator:
+  HistGradientBoostingRegressor (HGB)
+  • Type: Gradient boosting on histograms (efficient for tabular data).
+  • Hyperparameters used:
+      max_depth=6
+      learning_rate=0.08
+      max_iter=600
+      early_stopping=True
+      validation_fraction=0.1
+      l2_regularization=1e-6
+      random_state=42
+  • Notes: Early stopping uses an internal validation split. HGB handles missing values and monotonic constraints (not used here) and is typically faster than classic GradientBoostingRegressor.
+
+Target transformation:
+  TransformedTargetRegressor(
+    func=log1p, inverse_func=expm1
+  ) wraps HGB. This applies log1p to y during fit and expm1 during predict. Rationale: PM2.5 often has a heavy-tailed distribution; log transform stabilizes variance and improves model fit.
+
+Training process (train_hybrid.py):
+  • Data ingestion via pandas (CSV) or synthetic generation.
+  • Train/valid split (typ. 80/20). Fit pipeline on train, evaluate R² on valid.
+  • Artifact saving: pm25_pipeline.pkl and last_metrics.json.
+  • Design choice: Only pipeline is saved (no separate scaler) because tree-based models don’t need scaling and a single artifact simplifies Flask inference.
+
+Evaluation (eval_cv.py):
+  • KFold CV (e.g., 5 folds) with shuffling and fixed seed for reproducibility.
+  • Manual per-fold fit/predict loop to avoid joblib parallel backend issues on Windows (ModuleNotFoundError: _posixsubprocess). This keeps evaluation stable.
+  • Reports mean and std of R² and a percentage “accuracy” shorthand (R² × 100).
+
+Observed performance (example on included dataset):
+  • CV R² ≈ 0.58–0.62 depending on model version and settings.
+  • The current HGB + log-target + engineered features is designed for robustness and Windows compatibility; further tuning can improve results (see Tuning section).
+
+
+============================================================
+3) API INTEGRATIONS AND DATA FLOW
+============================================================
+
+External APIs (Open-Meteo, no API key required at the time of writing):
+  • Geocoding: https://geocoding-api.open-meteo.com/v1/search
+    - Inputs: name (q) and count
+    - Outputs: candidates with name, country, latitude, longitude, timezone
+  • Forecast Weather: https://api.open-meteo.com/v1/forecast
+    - Inputs: latitude, longitude, timezone; current/hourly variables requested
+    - Outputs: current block and hourly arrays of variables (temperature, humidity, precipitation, wind, pressure, etc.)
+  • Air Quality: https://air-quality-api.open-meteo.com/v1/air-quality
+    - Inputs: latitude, longitude, timezone; hourly pollutants requested
+    - Outputs: hourly arrays for pm10, pm2_5, nitrogen_dioxide, sulphur_dioxide, ozone
+
+Server flow:
+  1) Client searches → /api/geocode returns up to 5 matches.
+  2) Client selects a candidate (or uses q directly) → /api/weather fetches weather, then merges the AQ hourly arrays into weather.hourly under the same keys. This gives a unified hourly timeline to the frontend (including pm10, pm2_5, etc.).
+  3) Frontend constructs the feature vector from the latest hourly values and POSTs to /api/predict.
+  4) /api/predict loads ml/pm25_pipeline.pkl if needed, runs pipeline.predict on the 1×9 input array (FeatureAdder expands internally), and returns pm25 (µg/m³).
+  5) If the pipeline isn’t available (e.g., missing file or unpickle failure), the endpoint falls back to a deterministic heuristic estimate based on pm10, humidity, and temperature to keep the UX responsive.
+
+Frontend flow:
+  - app.js manages the UX state, invokes APIs, and handles response rendering.
+  - Chart.js renders a ring chart to visualize pollutant composition or other stats.
+  - CSS (style.css) applies the dark, sleek look, with cards and skeletons.
+
+
+============================================================
+4) LIBRARIES AND WHY THEY’RE USED
+============================================================
+
+Server/ML:
+  - Flask: Lightweight Python web framework. Serves HTML/JS/CSS and defines JSON API routes.
+  - requests: HTTP client to call Open-Meteo services.
+  - numpy: Array operations for feature assembly and numeric computations (safe casting to float, etc.).
+  - pandas: CSV loading, column selection/renaming, and basic data cleaning for training and evaluation.
+  - scikit-learn:
+      • Pipeline: Chains transformers and estimators into a single object.
+      • BaseEstimator, TransformerMixin: Implement FeatureAdder as a reusable, pickle-safe transformer.
+      • HistGradientBoostingRegressor: Strong, efficient gradient boosting on tabular data with early stopping.
+      • TransformedTargetRegressor: Log-transform target for better regression stability.
+      • KFold, r2_score: Cross-validation and evaluation metric.
+  - joblib: Saving/loading the trained pipeline artifact.
+  - pathlib: OS-agnostic path handling.
+
+Frontend:
+  - Chart.js: Canvas-based charting library for doughnut (ring) visualization.
+  - Vanilla JS + DOM APIs: Fetch, render, and manage UI state without a heavy framework.
+
+
+============================================================
+5) OPERATIONAL NOTES AND PITFALLS
+============================================================
+
+• Windows multiprocessing issues: Using joblib/sklearn parallelism can trigger ModuleNotFoundError: _posixsubprocess. The evaluation script avoids parallel CV by using a manual KFold loop. If parallel CV is desired, keep n_jobs=1 on Windows.
+
+• Unpickling stability: Always ensure custom transformers/classes referenced in the Pipeline are importable (not defined in __main__). This repo uses ml.features.FeatureAdder for that reason, and includes ml/__init__.py to make it a proper package.
+
+• Feature order invariance: The model expects inputs in FEATURES order. app.js must construct the payload in that exact order (and app.py maintains the same order list).
+
+• Fallback heuristic: When the pipeline is unavailable, /api/predict returns a heuristic PM2.5 estimate based on pm10, humidity, and temperature. This guarantees the UI still shows a value, though it’s less accurate than the ML model.
+
+• Dataset schema: The training/evaluation assume the presence (or alias mapping) of the 9 base feature columns plus the pm25 target. When bringing a new CSV, either use the same names or rely on the alias mapping in train_hybrid.py.
+
+
+============================================================
+6) TUNING AND EXTENSIONS
+============================================================
+
+• Hyperparameter tuning (for HistGradientBoostingRegressor):
+  - learning_rate: 0.03–0.15
+  - max_depth: 4–8
+  - max_iter: 400–1200
+  - l2_regularization: [0, 1e-6, 1e-5, 1e-4]
+  Use a small grid or Bayesian search; keep early_stopping to prevent overfitting.
+
+• Additional features:
+  - Temporal: hour of day, day of week, month (cyclical encoding) if timestamps are available.
+  - Location: city/region one-hot or target encoding (if generalizing across places).
+  - Meteorological interactions: further nonlinear terms if justified by data.
+
+• Alternative models:
+  - Gradient-boosted trees (XGBoost/LightGBM/CatBoost) if adding external dependencies is acceptable.
+  - Linear/GAM baselines for interpretability (with spline features).
+
+• Robustness:
+  - Add input validation on the server for ranges (e.g., RH 0–100%).
+  - Persist training metadata (FEATURES, alias map, train date) in last_metrics.json.
+
+
+============================================================
+7) QUICK REFERENCE: FILE → PURPOSE
+============================================================
+
+• app.py                           → Flask server, API routes, model loading, prediction.
+• requirements.txt                 → Project Python dependencies.
+• README.md                        → Project overview/how-to (if present).
+• data/pm25_weather_kaggleish.csv  → Training/evaluation dataset.
+• ml/__init__.py                   → Makes ml a package for import/pickling stability.
+• ml/features.py                   → FEATURES list, add_features(), FeatureAdder transformer.
+• ml/train_hybrid.py               → Train pipeline; save pm25_pipeline.pkl and last_metrics.json.
+• ml/eval_cv.py                    → Manual KFold CV evaluation; prints mean/std R².
+• ml/make_dataset.py               → Synthetic dataset generator (Kaggle-like format).
+• ml/pm25_pipeline.pkl             → Trained pipeline artifact used by Flask at runtime.
+• ml/last_metrics.json             → Train metrics dump.
+• ml/pm25_hybrid.pkl, ml/scaler.pkl→ Legacy artifacts (no longer used by app).
+• static/app.js                    → Frontend logic: search, geocode, weather, predict, Chart.js.
+• static/style.css                 → Dark sleek styles, skeletons, chips.
+• templates/index.html             → SPA shell served by Flask.
+
+
+End of file.
