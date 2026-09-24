@@ -1,4 +1,4 @@
-# AeroSense: Weather + PM2.5 Predictor (Flask)
+# AeroSense: Air Quality + PM2.5 Predictor (Flask)
 
 A single-page Flask app that lets you search any location, view its current weather (Open-Meteo), and instantly predicts PM2.5 using a lightweight hybrid ML model (RandomForest + ExtraTrees averaged with log1p target transform). Dark, sleek UI with modern CSS.
 
